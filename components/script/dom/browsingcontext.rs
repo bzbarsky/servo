@@ -5,7 +5,7 @@
 use dom::bindings::conversions::{ToJSValConvertible, root_from_handleobject};
 use dom::bindings::js::{JS, Root, RootedReference};
 use dom::bindings::proxyhandler::{fill_property_descriptor, get_property_descriptor};
-use dom::bindings::reflector::{DomObject, MutDomObject, Reflector};
+use dom::bindings::reflector::{DomObject, Reflector};
 use dom::bindings::trace::JSTraceable;
 use dom::bindings::utils::WindowProxyHandler;
 use dom::bindings::utils::get_array_index_from_id;
@@ -19,19 +19,25 @@ use js::jsapi::{JSAutoCompartment, JSContext, JSErrNum, JSFreeOp, JSObject};
 use js::jsapi::{JSPROP_READONLY, JSTracer, JS_DefinePropertyById};
 use js::jsapi::{JS_ForwardGetPropertyTo, JS_ForwardSetPropertyTo};
 use js::jsapi::{JS_GetOwnPropertyDescriptorById, JS_HasPropertyById};
+use js::jsapi::{JS_TransplantObject, SetWindowProxy};
 use js::jsapi::{MutableHandle, MutableHandleObject, MutableHandleValue};
 use js::jsapi::{ObjectOpResult, PropertyDescriptor};
 use js::jsval::{UndefinedValue, PrivateValue};
 use js::rust::get_object_class;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::ptr;
 
-#[dom_struct]
+#[must_root]
 // NOTE: the browsing context for a window is managed in two places:
 // here, in script, but also in the constellation. The constellation
 // manages the session history, which in script is accessed through
 // History objects, messaging the constellation.
 pub struct BrowsingContext {
-    reflector: Reflector,
+    /// The WindowProxy object.
+    /// Unlike other reflectors, we mutate this field because
+    /// we have to brain-transplant the reflector when the WindowProxy
+    /// changes Window.
+    reflector: RefCell<Reflector>,
 
     /// Has this browsing context been discarded?
     discarded: Cell<bool>,
@@ -40,11 +46,31 @@ pub struct BrowsingContext {
     frame_element: Option<JS<Element>>,
 }
 
+// We can't use the dom_struct annotation on BrowsingContext, since
+// its reflector is mutable, so we implement DomObject by hand.
+impl DomObject for BrowsingContext {
+    #[allow(unsafe_code)]
+    fn reflector(&self) -> &Reflector {
+        // TODO: This is not safe. Really really not safe.
+        let raw: *const Reflector = &*self.reflector.borrow();
+        unsafe { &*raw }
+    }
+}
+
+// Similarly, we have to trace BrowsingContext by hand.
+#[allow(unsafe_code)]
+unsafe impl JSTraceable for BrowsingContext {
+    unsafe fn trace(&self, trc: *mut JSTracer) {
+        self.reflector.borrow().trace(trc);
+        self.frame_element.trace(trc);
+    }
+}
+
 impl BrowsingContext {
     pub fn new_inherited(frame_element: Option<&Element>) -> BrowsingContext {
         BrowsingContext {
-            reflector: Reflector::new(),
-            discarded:  Cell::new(false),
+            reflector: RefCell::new(Reflector::new()),
+            discarded: Cell::new(false),
             frame_element: frame_element.map(JS::from_ref),
         }
     }
@@ -56,20 +82,18 @@ impl BrowsingContext {
             assert!(!handler.is_null());
 
             let cx = window.get_cx();
-            let parent = window.reflector().get_jsobject();
-            assert!(!parent.get().is_null());
-            assert!(((*get_object_class(parent.get())).flags & JSCLASS_IS_GLOBAL) != 0);
-            let _ac = JSAutoCompartment::new(cx, parent.get());
-            rooted!(in(cx) let window_proxy = NewWindowProxy(cx, parent, handler));
+            let window_jsobject = window.reflector().get_jsobject();
+            assert!(!window_jsobject.get().is_null());
+            assert!(((*get_object_class(window_jsobject.get())).flags & JSCLASS_IS_GLOBAL) != 0);
+            let _ac = JSAutoCompartment::new(cx, window_jsobject.get());
+            rooted!(in(cx) let window_proxy = NewWindowProxy(cx, window_jsobject, handler));
             assert!(!window_proxy.is_null());
 
             let object = box BrowsingContext::new_inherited(frame_element);
+            object.reflector.borrow_mut().set_jsobject(window_proxy.get());
 
             let raw = Box::into_raw(object);
             SetProxyExtra(window_proxy.get(), 0, &PrivateValue(raw as *const _));
-
-            (*raw).init_reflector(window_proxy.get());
-
             Root::from_ref(&*raw)
         }
     }
@@ -86,8 +110,41 @@ impl BrowsingContext {
         self.frame_element.r()
     }
 
+    #[allow(unsafe_code)]
+    /// Change the Window that this browsing context's WindowProxy resolves to.
+    // TODO: support setting the window proxy to a dummy value,
+    // to handle the case when the active document is in another script thread.
+    pub fn set_window_proxy(&self, window: &Window) {
+        unsafe {
+            let WindowProxyHandler(handler) = window.windowproxy_handler();
+            assert!(!handler.is_null());
+
+            let cx = window.get_cx();
+            let window_jsobject = window.reflector().get_jsobject();
+            let old_window_proxy = self.reflector.borrow().get_jsobject();
+            assert!(!window_jsobject.get().is_null());
+            assert!(((*get_object_class(window_jsobject.get())).flags & JSCLASS_IS_GLOBAL) != 0);
+            let _ac = JSAutoCompartment::new(cx, window_jsobject.get());
+
+            // Brain transpant the window proxy.
+            rooted!(in(cx) let mut new_window_proxy = NewWindowProxy(cx, window_jsobject, handler));
+            *new_window_proxy = JS_TransplantObject(cx, old_window_proxy, new_window_proxy.handle());
+
+            // Transfer ownership of this browsing context from the old window proxy to the new one.
+            SetProxyExtra(old_window_proxy.get(), 0, &PrivateValue(ptr::null_mut()));
+            SetProxyExtra(new_window_proxy.get(), 0, &PrivateValue(self as *const _ as *const _));
+
+            // Set the window proxy.
+            SetWindowProxy(cx, window_jsobject, new_window_proxy.handle());
+
+            // Create a new reflector.
+            *self.reflector.borrow_mut() = Reflector::new();
+            self.reflector.borrow_mut().set_jsobject(new_window_proxy.get());
+        }
+    }
+
     pub fn window_proxy(&self) -> *mut JSObject {
-        let window_proxy = self.reflector.get_jsobject();
+        let window_proxy = self.reflector.borrow().get_jsobject();
         assert!(!window_proxy.get().is_null());
         window_proxy.get()
     }

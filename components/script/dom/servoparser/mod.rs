@@ -108,7 +108,7 @@ impl ServoParser {
 
         // Step 1.
         let loader = DocumentLoader::new(&*context_document.loader());
-        let document = Document::new(window, None, Some(url.clone()),
+        let document = Document::new(window, false, Some(url.clone()),
                                      context_document.origin().alias(),
                                      IsHTMLDocument::HTMLDocument,
                                      None, None,

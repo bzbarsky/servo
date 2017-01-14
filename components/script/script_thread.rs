@@ -394,13 +394,15 @@ impl<'a> Iterator for DocumentsIter<'a> {
     }
 }
 
-
 #[derive(JSTraceable)]
 // ScriptThread instances are rooted on creation, so this is okay
 #[allow(unrooted_must_root)]
 pub struct ScriptThread {
     /// The documents for pipelines managed by this thread
     documents: DOMRefCell<Documents>,
+    /// The browsing contexts known by this thread
+    /// TODO: this map grows, but never shrinks.
+    browsing_contexts: DOMRefCell<HashMap<FrameId, JS<BrowsingContext>>>,
     /// A list of data pertaining to loads that have not yet received a network response
     incomplete_loads: DOMRefCell<Vec<InProgressLoad>>,
     /// A map to store service worker registrations for a given origin
@@ -661,6 +663,7 @@ impl ScriptThread {
 
         ScriptThread {
             documents: DOMRefCell::new(Documents::new()),
+            browsing_contexts: DOMRefCell::new(HashMap::new()),
             incomplete_loads: DOMRefCell::new(vec!()),
             registration_map: DOMRefCell::new(HashMap::new()),
             job_queue_map: Rc::new(JobQueue::new()),
@@ -1760,8 +1763,18 @@ impl ScriptThread {
                                  self.webvr_thread.clone());
         let frame_element = frame_element.r().map(Castable::upcast);
 
-        let browsing_context = BrowsingContext::new(&window, frame_element);
-        window.init_browsing_context(&browsing_context);
+        match self.browsing_contexts.borrow_mut().entry(incomplete.frame_id) {
+            hash_map::Entry::Vacant(entry) => {
+                let browsing_context = BrowsingContext::new(&window, frame_element);
+                entry.insert(JS::from_ref(&*browsing_context));
+                window.init_browsing_context(&browsing_context);
+            },
+            hash_map::Entry::Occupied(entry) => {
+                let browsing_context = entry.get();
+                browsing_context.set_window_proxy(&window);
+                window.init_browsing_context(browsing_context);
+            },
+        }
 
         let last_modified = metadata.headers.as_ref().and_then(|headers| {
             headers.get().map(|&LastModified(HttpDate(ref tm))| dom_last_modified(tm))
@@ -1819,7 +1832,7 @@ impl ScriptThread {
         };
 
         let document = Document::new(&window,
-                                     Some(&browsing_context),
+                                     true,
                                      Some(final_url.clone()),
                                      incomplete.origin,
                                      is_html_document,
