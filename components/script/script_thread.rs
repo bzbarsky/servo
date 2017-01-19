@@ -1584,29 +1584,26 @@ impl ScriptThread {
             load.pipeline_id == id
         });
 
-        if let Some(idx) = idx {
+        let chan = if let Some(idx) = idx {
             let load = self.incomplete_loads.borrow_mut().remove(idx);
-
-            // Tell the layout thread to begin shutting down, and wait until it
-            // processed this message.
-            let (response_chan, response_port) = channel();
-            let chan = &load.layout_chan;
-            if chan.send(message::Msg::PrepareToExit(response_chan)).is_ok() {
-                debug!("shutting down layout for page {}", id);
-                response_port.recv().unwrap();
-                chan.send(message::Msg::ExitNow).ok();
-            }
-        }
-
-        if let Some(document) = self.documents.borrow_mut().remove(id) {
-            shut_down_layout(document.window());
+            load.layout_chan.clone()
+        } else if let Some(document) = self.documents.borrow_mut().remove(id) {
+            let window = document.window();
             if discard_bc == DiscardBrowsingContext::Yes {
-                if let Some(context) = document.browsing_context() {
-                    context.discard();
-                }
+                window.browsing_context().discard();
             }
-            let _ = self.constellation_chan.send(ConstellationMsg::PipelineExited(id));
-        }
+            window.clear_js_runtime();
+            window.layout_chan().clone()
+        } else {
+            return warn!("Exiting nonexistant pipeline {}.", id);
+        };
+
+        let (response_chan, response_port) = channel();
+        chan.send(message::Msg::PrepareToExit(response_chan)).ok();
+        debug!("shutting down layout for page {}", id);
+        response_port.recv().unwrap();
+        chan.send(message::Msg::ExitNow).ok();
+        self.constellation_chan.send(ConstellationMsg::PipelineExited(id)).ok();
 
         debug!("Exited pipeline {}.", id);
     }
@@ -2269,29 +2266,6 @@ impl Drop for ScriptThread {
             root.set(None);
         });
     }
-}
-
-/// Shuts down layout for the given window.
-fn shut_down_layout(window: &Window) {
-    // Tell the layout thread to begin shutting down, and wait until it
-    // processed this message.
-    let (response_chan, response_port) = channel();
-    let chan = window.layout_chan().clone();
-    if chan.send(message::Msg::PrepareToExit(response_chan)).is_ok() {
-        let _ = response_port.recv();
-    }
-
-    // The browsing context is cleared by window.clear_js_runtime(), so we need to save a copy
-    let browsing_context = window.browsing_context();
-
-    // Drop our references to the JSContext and DOM objects.
-    window.clear_js_runtime();
-
-    // Discard the browsing context.
-    browsing_context.discard();
-
-    // Destroy the layout thread. If there were node leaks, layout will now crash safely.
-    chan.send(message::Msg::ExitNow).ok();
 }
 
 fn dom_last_modified(tm: &Tm) -> String {
